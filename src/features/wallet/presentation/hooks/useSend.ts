@@ -3,6 +3,15 @@
 import { useCallback, useRef, useState } from "react";
 import { useUser } from "@/features/user/presentation/context/UserContext";
 import { useWallet } from "@/features/wallet";
+import { walletApiErrorMessage } from "@/features/wallet/utils/wallet-api-errors";
+import { getStellarNetworkConfig } from "../../config/stellar-network";
+import { mapWalletError } from "../../utils/wallet-errors";
+
+async function apiFailure(response: Response, fallback: string): Promise<{ message: string; code?: string }> {
+  const body = await response.json().catch(() => ({})) as { message?: string; code?: string; error?: string };
+  const code = body.code || body.error;
+  return { code, message: walletApiErrorMessage(code, body.message || fallback) };
+}
 
 export type SendStep =
   | "form"
@@ -25,16 +34,19 @@ export interface SendState {
   step: SendStep;
   recipient: RecipientInfo | null;
   fee: string | null;
+  network?: string | null;
   txHash: string | null;
   errorMessage: string | null;
+  recipientError?: string | null;
 }
 
 export function useSend() {
   const { accessToken } = useUser();
-  const { signTransaction } = useWallet();
+  const { signTransaction, assertCorrectNetwork } = useWallet();
   const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000";
-  const network = process.env.NEXT_PUBLIC_STELLAR_NETWORK ?? "TESTNET";
+  const network = getStellarNetworkConfig().network.toUpperCase();
   const preparedXdrRef = useRef<string | null>(null);
+  const confirmInFlightRef = useRef(false);
 
   const [state, setState] = useState<SendState>({
     step: "form",
@@ -47,9 +59,11 @@ export function useSend() {
   const resolveAndPrepare = useCallback(
     async (query: string, amount: string, assetCode?: string) => {
       setState(s => ({ ...s, step: "loading", errorMessage: null }));
+      let resolvingRecipient = true;
       preparedXdrRef.current = null;
 
       try {
+        await assertCorrectNetwork();
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
@@ -58,10 +72,15 @@ export function useSend() {
           { headers }
         );
         if (!resolveRes.ok) {
-          const body = await resolveRes.json().catch(() => ({}));
-          throw new Error((body as { message?: string })?.message ?? "Could not resolve recipient");
+          const failure = await apiFailure(resolveRes, "Could not resolve recipient");
+          throw Object.assign(new Error(failure.message), { code: failure.code });
         }
         const recipient: RecipientInfo = await resolveRes.json();
+        resolvingRecipient = false;
+
+        // Recipient lookup can take long enough for the wallet network to
+        // change. Recheck immediately before asking the backend to prepare XDR.
+        await assertCorrectNetwork();
 
         const prepareBody: { recipient: string; amount: string; asset?: string } = {
           recipient: recipient.address,
@@ -77,8 +96,8 @@ export function useSend() {
           body: JSON.stringify(prepareBody),
         });
         if (!prepareRes.ok) {
-          const body = await prepareRes.json().catch(() => ({}));
-          throw new Error((body as { message?: string })?.message ?? "Failed to prepare transaction");
+          const failure = await apiFailure(prepareRes, "Failed to prepare transaction");
+          throw new Error(failure.message);
         }
         const prepared = await prepareRes.json() as Record<string, string>;
 
@@ -89,46 +108,51 @@ export function useSend() {
         }
 
         preparedXdrRef.current = xdr;
-        setState(s => ({ ...s, step: "confirm", recipient, fee: prepared.fee ?? null }));
+        setState(s => ({ ...s, step: "confirm", recipient, fee: prepared.fee ?? null, network: prepared.network ?? network, recipientError: null }));
       } catch (err) {
-        setState(s => ({
-          ...s,
-          step: "error",
-          errorMessage: err instanceof Error ? err.message : "An unexpected error occurred",
-        }));
+        const code = (err as { code?: string })?.code;
+        const message = err instanceof Error ? walletApiErrorMessage(code, err.message) : "An unexpected error occurred";
+        setState(s => resolvingRecipient
+          ? { ...s, step: "form", recipientError: message, errorMessage: null }
+          : { ...s, step: "error", errorMessage: message });
       }
     },
-    [accessToken, apiUrl]
+    [accessToken, apiUrl, assertCorrectNetwork]
   );
 
   const confirmSend = useCallback(async () => {
     const xdr = preparedXdrRef.current;
+    if (confirmInFlightRef.current) return;
     if (!xdr) {
       setState(s => ({ ...s, step: "error", errorMessage: "Transaction data missing — please go back and try again." }));
       return;
     }
 
-    setState(s => ({ ...s, step: "signing", errorMessage: null }));
-
-    let signedXdr: string;
+    confirmInFlightRef.current = true;
     try {
-      signedXdr = await signTransaction(xdr, network);
-    } catch (err) {
-      const msg =
-        err instanceof Error ? err.message :
-        typeof err === "string" ? err :
-        "Signing failed";
-      const isCancelled = /cancel|decline|reject|denied|user rejected/i.test(msg);
-      setState(s => ({
-        ...s,
-        step: isCancelled ? "cancelled" : "error",
-        errorMessage: isCancelled ? null : msg,
-      }));
-      return;
-    }
+      setState(s => ({ ...s, step: "signing", errorMessage: null }));
 
-    setState(s => ({ ...s, step: "submitting" }));
-    try {
+      let signedXdr: string;
+      try {
+        signedXdr = await signTransaction(xdr, network);
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message :
+          typeof err === "string" ? err :
+          "Signing failed";
+        const isCancelled = /cancel|decline|reject|denied|user rejected/i.test(msg);
+        setState(s => ({
+          ...s,
+          step: isCancelled ? "cancelled" : "error",
+          errorMessage: isCancelled ? null : mapWalletError(err),
+        }));
+        return;
+      }
+
+      setState(s => ({ ...s, step: "submitting" }));
+      // A submission timeout has an unknown outcome. Consume the prepared XDR
+      // before sending so retrying cannot submit the same payment twice.
+      preparedXdrRef.current = null;
       const submitHeaders: Record<string, string> = { "Content-Type": "application/json" };
       if (accessToken) submitHeaders["Authorization"] = `Bearer ${accessToken}`;
       const submitRes = await fetch(`${apiUrl}/send/submit`, {
@@ -137,8 +161,8 @@ export function useSend() {
         body: JSON.stringify({ signedXdr }),
       });
       if (!submitRes.ok) {
-        const body = await submitRes.json().catch(() => ({}));
-        throw new Error((body as { message?: string })?.message ?? "Transaction submission failed");
+        const failure = await apiFailure(submitRes, "Transaction submission failed");
+        throw new Error(failure.message);
       }
       const result: { hash?: string } = await submitRes.json();
       setState(s => ({ ...s, step: "success", txHash: result.hash ?? null }));
@@ -148,17 +172,21 @@ export function useSend() {
         step: "error",
         errorMessage: err instanceof Error ? err.message : "Transaction submission failed",
       }));
+    } finally {
+      confirmInFlightRef.current = false;
     }
   }, [accessToken, apiUrl, signTransaction, network]);
 
   const reset = useCallback(() => {
     preparedXdrRef.current = null;
-    setState({ step: "form", recipient: null, fee: null, txHash: null, errorMessage: null });
+    setState({ step: "form", recipient: null, fee: null, txHash: null, errorMessage: null, recipientError: null });
   }, []);
+
+  const clearRecipientError = useCallback(() => setState(s => ({ ...s, recipientError: null })), []);
 
   const backToConfirm = useCallback(() => {
     setState(s => ({ ...s, step: "confirm", errorMessage: null }));
   }, []);
 
-  return { state, resolveAndPrepare, confirmSend, reset, backToConfirm };
+  return { state, resolveAndPrepare, confirmSend, reset, backToConfirm, clearRecipientError };
 }
