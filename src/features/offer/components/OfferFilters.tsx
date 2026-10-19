@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { OfferFilters as OfferFiltersType, DEFAULT_FILTERS } from "../types/offer-filter.types";
 import { FilterValidationErrors } from "../types/offer-filter.types";
 import { OfferSortSelect } from "./OfferSortSelect";
@@ -18,6 +18,8 @@ interface OfferFiltersProps {
     onDraftFilterChange: <K extends keyof OfferFiltersType>(key: K, value: OfferFiltersType[K]) => void;
     /** Commits the mobile draft to live state */
     onApplyDraft: () => void;
+    onApplyPreset: (filters: OfferFiltersType) => void;
+    onOpenDraft: () => void;
     onClearFilters: () => void;
 }
 
@@ -234,6 +236,8 @@ function DesktopFilterBar({
                 error={errors.maxAmount}
                 onChange={handleMaxChange}
             />
+            <UncontrolledAmountInput id="desktop-min-price" label="Min Price (USD)" defaultValue={filters.minPrice} resetKey={`min-price-${filters.minPrice === "" ? "empty" : "set"}`} placeholder="0.00" error={errors.minPrice} onChange={(v) => onFilterChange("minPrice", v)} />
+            <UncontrolledAmountInput id="desktop-max-price" label="Max Price (USD)" defaultValue={filters.maxPrice} resetKey={`max-price-${filters.maxPrice === "" ? "empty" : "set"}`} placeholder="No limit" error={errors.maxPrice} onChange={(v) => onFilterChange("maxPrice", v)} />
             <div className="flex flex-col gap-1.5">
                 <label className="text-[#9BABB7] text-[10px] font-bold tracking-widest uppercase">Sort By</label>
                 <OfferSortSelect
@@ -327,6 +331,10 @@ function MobileFilterDrawer({
                         onChange={(v) => onDraftFilterChange("maxAmount", v)}
                     />
                 </div>
+                <div className="grid grid-cols-2 gap-3">
+                    <AmountInput id="mobile-min-price" label="Min Price (USD)" value={draftFilters.minPrice} placeholder="0.00" error={errors.minPrice} onChange={(v) => onDraftFilterChange("minPrice", v)} />
+                    <AmountInput id="mobile-max-price" label="Max Price (USD)" value={draftFilters.maxPrice} placeholder="No limit" error={errors.maxPrice} onChange={(v) => onDraftFilterChange("maxPrice", v)} />
+                </div>
                 <div className="flex flex-col gap-1.5">
                     <span className="text-[#9BABB7] text-[10px] font-bold tracking-widest uppercase">Sort By</span>
                     <OfferSortSelect
@@ -371,19 +379,95 @@ export function OfferFilters({
     onFilterChange,
     onDraftFilterChange,
     onApplyDraft,
+    onApplyPreset,
+    onOpenDraft,
     onClearFilters,
 }: OfferFiltersProps) {
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
+    const [presets, setPresets] = useState<{ name: string; filters: OfferFiltersType }[]>([]);
+    const [presetName, setPresetName] = useState("");
+    const [selectedPreset, setSelectedPreset] = useState("");
+    const [presetMessage, setPresetMessage] = useState("");
+    const presetStorageKey = "local-settle:marketplace-filter-presets";
+
+    useEffect(() => {
+        try {
+            const saved = JSON.parse(localStorage.getItem(presetStorageKey) || "[]");
+            if (Array.isArray(saved)) {
+                setPresets(saved.filter((item): item is { name: string; filters: OfferFiltersType } =>
+                    typeof item?.name === "string" && !!item.name.trim() &&
+                    item.filters && typeof item.filters === "object" &&
+                    typeof item.filters.paymentMethod === "string" &&
+                    typeof item.filters.asset === "string" &&
+                    typeof item.filters.minAmount === "string" &&
+                    typeof item.filters.maxAmount === "string" &&
+                    ["best_match", "price_asc", "price_desc", "completion_rate_desc", "newest"].includes(item.filters.sort)
+                ));
+            }
+        } catch {
+            setPresets([]);
+        }
+    }, []);
+
+    const savePresets = (next: typeof presets) => {
+        setPresets(next);
+        try { localStorage.setItem(presetStorageKey, JSON.stringify(next)); } catch { /* Storage may be disabled. */ }
+    };
+
+    const applySelectedPreset = () => {
+        const preset = presets.find((item) => item.name === selectedPreset);
+        if (!preset) return;
+        const isAmount = (value: string) => value === "" || (Number.isFinite(Number(value)) && Number(value) >= 0);
+        let next = {
+            ...preset.filters,
+            paymentMethod: availablePaymentMethods.includes(preset.filters.paymentMethod) ? preset.filters.paymentMethod : "",
+            asset: availableAssets.includes(preset.filters.asset) ? preset.filters.asset : "",
+            minAmount: isAmount(preset.filters.minAmount) ? preset.filters.minAmount : "",
+            maxAmount: isAmount(preset.filters.maxAmount) ? preset.filters.maxAmount : "",
+        };
+        if (next.minAmount && next.maxAmount && Number(next.minAmount) > Number(next.maxAmount)) {
+            next = { ...next, minAmount: "", maxAmount: "" };
+        }
+        onApplyPreset(next);
+        setPresetMessage("Preset applied; unavailable or invalid filters were cleared.");
+    };
 
     const isDefault =
         filters.paymentMethod === DEFAULT_FILTERS.paymentMethod &&
         filters.asset === DEFAULT_FILTERS.asset &&
         filters.minAmount === DEFAULT_FILTERS.minAmount &&
         filters.maxAmount === DEFAULT_FILTERS.maxAmount &&
+        filters.minPrice === DEFAULT_FILTERS.minPrice &&
+        filters.maxPrice === DEFAULT_FILTERS.maxPrice &&
         filters.sort === DEFAULT_FILTERS.sort;
 
     return (
         <>
+            <div className="mb-3 flex flex-wrap items-center gap-2" aria-label="Saved marketplace filters">
+                <label htmlFor="saved-filter-preset" className="sr-only">Saved filter preset</label>
+                <select id="saved-filter-preset" value={selectedPreset} onChange={(e) => setSelectedPreset(e.target.value)} className="rounded-lg border border-[#263949] bg-[#1a1a1c] px-3 py-2 text-sm text-white">
+                    <option value="">Saved presets</option>
+                    {presets.map((preset) => <option key={preset.name} value={preset.name}>{preset.name}</option>)}
+                </select>
+                <button type="button" onClick={applySelectedPreset} disabled={!selectedPreset} className="rounded-lg border border-[#263949] px-3 py-2 text-xs text-white disabled:opacity-50">Apply</button>
+                <button type="button" onClick={() => {
+                    const name = presetName.trim();
+                    if (!name) { setPresetMessage("Enter a name to save this preset."); return; }
+                    const next = [...presets.filter((item) => item.name !== name), { name, filters }];
+                    savePresets(next);
+                    setSelectedPreset(name);
+                    setPresetName("");
+                    setPresetMessage("Preset saved in this browser.");
+                }} className="rounded-lg border border-[#263949] px-3 py-2 text-xs text-white">Save current</button>
+                <input value={presetName} onChange={(e) => setPresetName(e.target.value)} aria-label="Preset name" placeholder="Preset name" className="w-32 rounded-lg border border-[#263949] bg-[#1a1a1c] px-3 py-2 text-xs text-white" />
+                <button type="button" onClick={() => {
+                    const next = presets.filter((item) => item.name !== selectedPreset);
+                    savePresets(next);
+                    setSelectedPreset("");
+                    setPresetMessage("Preset deleted.");
+                }} disabled={!selectedPreset} className="rounded-lg border border-[#263949] px-3 py-2 text-xs text-white disabled:opacity-50">Delete</button>
+                {presetMessage && <span role="status" className="text-xs text-[#9BABB7]">{presetMessage}</span>}
+            </div>
             <div className="w-full flex items-center justify-between gap-4 flex-wrap">
                 {/* Desktop bar */}
                 <DesktopFilterBar
@@ -397,7 +481,7 @@ export function OfferFilters({
                 {/* Mobile trigger */}
                 <button
                     id="mobile-filter-trigger"
-                    onClick={() => setIsDrawerOpen(true)}
+                    onClick={() => { onOpenDraft(); setIsDrawerOpen(true); }}
                     className="md:hidden flex items-center gap-2 px-4 py-2.5 rounded-xl
                                bg-[#1a1a1c] border border-[#263949] text-white text-sm font-bold
                                hover:border-[#55D6BE]/40 transition-colors duration-200 relative"

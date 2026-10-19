@@ -7,6 +7,8 @@ import { useSignatureCancellation } from "@/features/wallet/hooks/useSignatureCa
 import { Info, Upload, FileUp, CircleCheck, Loader2, Search, Trash2 } from "lucide-react";
 import { SignatureCancelledModal } from "../../components/SignatureCancelledModal";
 import { useNotifications } from "@/features/notifications";
+import { escrowErrorGuidance } from "@/features/escrow/utils/escrow-error-guidance";
+import { validateEvidenceFile } from "@/features/escrow/utils/evidence-file";
 import { ApiError } from "@/lib/api";
 
 export interface TradeEvidenceUploaderProps {
@@ -20,10 +22,12 @@ export interface TradeEvidenceUploaderProps {
     isBuyer: boolean;
     evidenceUrl?: string | null;
     onStatusChange: () => void;
+    refreshStatus: () => Promise<string | null | undefined>;
     canCancel: boolean;
     isCancelling: boolean;
     isExpired?: boolean;
     onCancelOrder: () => void;
+    paymentInstructionsAvailable?: boolean;
 }
 
 export function TradeEvidenceUploader({
@@ -36,9 +40,11 @@ export function TradeEvidenceUploader({
     isBuyer,
     evidenceUrl,
     onStatusChange,
+    refreshStatus,
     canCancel,
     isCancelling,
     onCancelOrder,
+    paymentInstructionsAvailable = true,
     isExpired = false,
 }: TradeEvidenceUploaderProps) {
     const { markFiatSent, syncEscrow, uploadEvidence } = useEscrows();
@@ -51,6 +57,8 @@ export function TradeEvidenceUploader({
     );
     const [uploadProgress, setUploadProgress] = useState(0);
     const [uploadedTime, setUploadedTime] = useState<string | null>(null);
+    const [evidenceUnavailable, setEvidenceUnavailable] = useState(false);
+    const [fileError, setFileError] = useState<string | null>(null);
 
     const [isDragging, setIsDragging] = useState(false);
     const [isSubmitting, setIsSubmitting] = useState(false);
@@ -67,6 +75,7 @@ export function TradeEvidenceUploader({
     // Sync with incoming evidenceUrl prop (e.g. on page refresh or peer update)
     useEffect(() => {
         if (evidenceUrl) {
+            setEvidenceUnavailable(false);
             setEvidenceUrlState(evidenceUrl);
             setUploadState('uploaded');
             if (!uploadedTime) {
@@ -86,21 +95,27 @@ export function TradeEvidenceUploader({
         }
     }, [evidenceUrl, escrowStatus, uploadedTime]);
 
+    const selectEvidenceFile = (file: File) => {
+        const validationError = validateEvidenceFile(file);
+        if (validationError) {
+            setFileError(validationError);
+            notify("error", validationError);
+            if (fileInputRef.current) fileInputRef.current.value = "";
+            return;
+        }
+        setFileError(null);
+        setUploadedFile(file);
+        setUploadState('selected');
+        uploadKeyRef.current = crypto.randomUUID();
+        setUploadProgress(0);
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        setPreviewUrl(URL.createObjectURL(file));
+    };
+
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         if (isExpired) return;
-        if (e.target.files && e.target.files.length > 0) {
-            const file = e.target.files[0];
-            setUploadedFile(file);
-            setUploadState('selected');
-            uploadKeyRef.current = crypto.randomUUID();
-            setUploadProgress(0);
-            
-            if (previewUrl) {
-                URL.revokeObjectURL(previewUrl);
-            }
-            const url = URL.createObjectURL(file);
-            setPreviewUrl(url);
-        }
+        const file = e.target.files?.[0];
+        if (file) selectEvidenceFile(file);
     };
 
     const handleDragOver = (e: React.DragEvent) => {
@@ -117,19 +132,8 @@ export function TradeEvidenceUploader({
         if (isExpired) return;
         e.preventDefault();
         setIsDragging(false);
-        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-            const file = e.dataTransfer.files[0];
-            setUploadedFile(file);
-            setUploadState('selected');
-            uploadKeyRef.current = crypto.randomUUID();
-            setUploadProgress(0);
-            
-            if (previewUrl) {
-                URL.revokeObjectURL(previewUrl);
-            }
-            const url = URL.createObjectURL(file);
-            setPreviewUrl(url);
-        }
+        const file = e.dataTransfer.files?.[0];
+        if (file) selectEvidenceFile(file);
     };
 
     const triggerUpload = () => {
@@ -207,12 +211,12 @@ export function TradeEvidenceUploader({
     };
 
     const handleAction = async () => {
-        if (isExpired || !isBuyer || escrowStatus !== "funded" || isSubmitting || !buyerAddress || !escrowId || !evidenceUrlState) return;
+        if (isExpired || !isBuyer || escrowStatus !== "funded" || isSubmitting || !paymentInstructionsAvailable || !buyerAddress || !escrowId || !evidenceUrlState) return;
         setShowPaymentConfirmation(true);
     };
 
     const handleConfirmPaymentSent = async () => {
-        if (isExpired || !isBuyer || escrowStatus !== "funded" || submissionLockRef.current || !buyerAddress || !escrowId || !evidenceUrlState) return;
+        if (isExpired || !isBuyer || escrowStatus !== "funded" || !paymentInstructionsAvailable || submissionLockRef.current || !buyerAddress || !escrowId || !evidenceUrlState) return;
         submissionLockRef.current = true;
         setShowPaymentConfirmation(false);
         setIsSubmitting(true);
@@ -238,7 +242,7 @@ export function TradeEvidenceUploader({
                 onStatusChange();
                 return;
             }
-            alert(`Error processing action: ${err instanceof Error ? err.message : String(err)}`);
+            notify("error", escrowErrorGuidance(err));
         } finally {
             submissionLockRef.current = false;
             setIsSubmitting(false);
@@ -251,9 +255,14 @@ export function TradeEvidenceUploader({
     };
 
     const handleSignatureRetry = async () => {
-        if (isExpired || !escrowId) return;
+        if (isExpired || !paymentInstructionsAvailable || !escrowId) return;
         setIsSubmitting(true);
         try {
+            const status = await refreshStatus();
+            if (status !== "funded") {
+                notify("warning", "Escrow status could not confirm that retrying is safe. Refresh the trade before signing again.");
+                return;
+            }
             const signedXdr = await sig.retry();
             await syncEscrow({ escrowId, action: "fiat_sent", signedXdr });
             notify("success", "Payment confirmed and registered successfully!");
@@ -265,7 +274,7 @@ export function TradeEvidenceUploader({
                 onStatusChange();
                 return;
             }
-            notify("error", `Error: ${err instanceof Error ? err.message : String(err)}`);
+            notify("error", escrowErrorGuidance(err));
         } finally {
             setIsSubmitting(false);
         }
@@ -301,17 +310,23 @@ export function TradeEvidenceUploader({
 
         if (isPdfFile) {
             return (
-                <iframe 
+                <iframe title="Payment evidence PDF preview"
                     src={`${url}#toolbar=0&navpanes=0&scrollbar=0`} 
                     className="w-full h-full border-0 pointer-events-none rounded-[8px]" 
                 />
             );
         }
 
+        const extension = uploadedFile?.name.split(".").pop()?.toLowerCase() ?? evidenceUrlState?.split("?")[0].split(".").pop()?.toLowerCase();
+        if (!uploadedFile && !["png", "jpg", "jpeg", "webp"].includes(extension ?? "")) {
+            return <div className="p-2 text-center text-xs text-[#C2C7D0]">Preview unavailable for this file type.</div>;
+        }
+        if (evidenceUnavailable) return <div role="status" className="p-2 text-center text-xs text-amber-300">Evidence link expired or unavailable. Refresh access to try again.</div>;
         return (
             <img 
                 src={url} 
                 alt="Uploaded receipt preview" 
+                onError={() => setEvidenceUnavailable(true)}
                 className="w-full h-full object-cover rounded-[8px]" 
             />
         );
@@ -321,7 +336,7 @@ export function TradeEvidenceUploader({
 
     return (
         <>
-        <div className="bg-[#0D1D2C] w-[402.8px] h-[571.5px] rounded-[16px] flex flex-col justify-between p-[12px_16px] gap-6 font-space shrink-0 select-none">
+        <div className="bg-[#0D1D2C] w-full min-h-[571.5px] md:w-[402.8px] md:h-[571.5px] rounded-[16px] flex flex-col justify-between p-[12px_16px] gap-6 font-space md:shrink-0 select-none">
             
             {/* Header Info Banner */}
             <div className="bg-[#0D1D2C] border-l border-[rgba(69,73,50,0.3)] rounded-[8px] p-[20px_12px] h-[99px] flex gap-3 shrink-0">
@@ -340,8 +355,9 @@ export function TradeEvidenceUploader({
                     ref={fileInputRef} 
                     onChange={handleFileChange} 
                     className="hidden" 
-                    accept="image/*,application/pdf"
+                    accept=".jpg,.jpeg,.png,.webp,.pdf,image/jpeg,image/png,image/webp,application/pdf"
                 />
+                {fileError && <p role="alert" className="text-red-300 text-xs">{fileError}</p>}
                 
                 {!isEvidenceSubmitted && (
                     <button 
@@ -445,6 +461,9 @@ export function TradeEvidenceUploader({
                             <p className="text-[14px] font-bold text-white truncate w-full">
                                 {uploadedFile ? uploadedFile.name : getFilenameFromUrl(evidenceUrlState)}
                             </p>
+                            {(uploadedFile || evidenceUrlState) && <p className="text-[10px] text-[#9BABB7]">File type: {(uploadedFile?.name.split(".").pop() || evidenceUrlState?.split("?")[0].split(".").pop() || "unknown").toUpperCase()}</p>}
+                            {evidenceUnavailable && <p role="status" className="text-[11px] text-amber-300">Link expired or unavailable.</p>}
+                            {evidenceUrlState && uploadState === "uploaded" && <button type="button" onClick={() => { setEvidenceUnavailable(false); onStatusChange(); }} className="w-fit text-left text-[10px] text-[#55D6BE] underline">Refresh evidence access</button>}
                             
                             {uploadState === 'selected' && (
                                 <p className="text-[12px] text-[#C2C7D0] font-semibold">
@@ -488,6 +507,11 @@ export function TradeEvidenceUploader({
 
             {/* Action Footer */}
             <div className="flex flex-col gap-3 shrink-0">
+                {escrowStatus === "funded" && !paymentInstructionsAvailable && (
+                    <p role="alert" className="rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-100">
+                        Payment instructions are unavailable. Contact support before sending funds.
+                    </p>
+                )}
                 {escrowStatus === "pending" || escrowStatus === "initialized" ? (
                     <button type="button" disabled className="bg-[#2A292F] w-full h-[56px] text-[#C2C7D0] font-extrabold text-[16px] leading-[24px] rounded-[12px] uppercase cursor-not-allowed tracking-[-0.4px]">
                         WAITING FOR FUNDING
@@ -496,11 +520,11 @@ export function TradeEvidenceUploader({
                     <button 
                         type="button" 
                         onClick={handleAction}
-                        disabled={isExpired || isSubmitting || uploadState !== 'uploaded'}
+                        disabled={isExpired || isSubmitting || uploadState !== 'uploaded' || !paymentInstructionsAvailable}
                         className="bg-[#55D6BE] disabled:bg-[#11212E] disabled:text-[rgba(155,171,183,0.5)] disabled:cursor-not-allowed w-full h-[56px] text-[#081521] font-extrabold text-[16px] leading-[24px] rounded-[12px] hover:bg-[#38B99F] uppercase transition-all duration-200 flex items-center justify-center gap-2 tracking-[-0.4px] cursor-pointer"
                     >
                         {isSubmitting ? <Loader2 className="w-5 h-5 text-[#081521] animate-spin" /> : <CircleCheck className="w-5 h-5 text-[#081521] stroke-[3px]" />}
-                        {isSubmitting ? "PROCESSING..." : "MARK AS PAID"}
+                        {isSubmitting ? "PROCESSING..." : paymentInstructionsAvailable ? "MARK AS PAID" : "PAYMENT DETAILS UNAVAILABLE"}
                     </button>
                 ) : escrowStatus === "fiat_sent" ? (
                     <button type="button" disabled className="bg-[#2A292F] w-full h-[56px] text-[#C2C7D0] font-extrabold text-[16px] leading-[24px] rounded-[12px] uppercase cursor-not-allowed tracking-[-0.4px]">

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { WalletProvider, useWalletContext } from "../WalletContext";
 import * as walletServiceModule from "../../../application/wallet.service";
 
@@ -46,7 +47,13 @@ vi.mock("next/navigation", () => ({
 const mockedWalletService = vi.mocked(walletServiceModule.walletService);
 
 function renderWalletContext() {
-    return renderHook(() => useWalletContext(), { wrapper: WalletProvider });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+        <QueryClientProvider client={queryClient}>
+            <WalletProvider>{children}</WalletProvider>
+        </QueryClientProvider>
+    );
+    return { ...renderHook(() => useWalletContext(), { wrapper }), queryClient };
 }
 
 describe("WalletContext", () => {
@@ -128,13 +135,14 @@ describe("WalletContext", () => {
             .mockResolvedValueOnce("GABC_FREIGHTER")
             .mockResolvedValueOnce("GXYZ_LOBSTR");
 
-        const { result } = renderWalletContext();
+        const { result, queryClient } = renderWalletContext();
         await waitFor(() => expect(result.current.isLoading).toBe(false));
 
         await act(async () => {
             await result.current.connect("freighter-id");
         });
         expect(result.current.publicKey).toBe("GABC_FREIGHTER");
+        queryClient.setQueryData(["private", "wallet"], { balance: "cached" });
 
         await act(async () => {
             await result.current.connect("lobstr-id");
@@ -142,21 +150,22 @@ describe("WalletContext", () => {
 
         expect(result.current.publicKey).toBe("GXYZ_LOBSTR");
         expect(result.current.walletId).toBe("lobstr-id");
+        expect(queryClient.getQueryData(["private", "wallet"])).toBeUndefined();
     });
 
-    it("surfaces a rejected connection as an error and notifies the user", async () => {
+    it("treats a user-rejected connection as a cancellation", async () => {
         mockedWalletService.connect.mockRejectedValueOnce({ code: -4, message: "The user rejected this request." });
 
         const { result } = renderWalletContext();
         await waitFor(() => expect(result.current.isLoading).toBe(false));
 
         await act(async () => {
-            await expect(result.current.connect("freighter-id")).rejects.toBeTruthy();
+            await result.current.connect("freighter-id");
         });
 
         expect(result.current.isConnected).toBe(false);
-        expect(result.current.error).toBe("Connection request was rejected.");
-        expect(mockNotify).toHaveBeenCalledWith("error", "Connection request was rejected.");
+        expect(result.current.error).toBeNull();
+        expect(mockNotify).not.toHaveBeenCalled();
     });
 
     it("rejects connection when the account isn't funded on Testnet", async () => {
@@ -215,6 +224,24 @@ describe("WalletContext", () => {
         await waitFor(() => expect(result.current.isLoading).toBe(false));
         expect(result.current.isConnected).toBe(false);
         expect(result.current.publicKey).toBeNull();
+    });
+
+    it("clears the authenticated account when the provider changes accounts in the background", async () => {
+        mockedWalletService.connect.mockResolvedValueOnce("GABC_OLD_ACCOUNT");
+        const { result, queryClient } = renderWalletContext();
+        await waitFor(() => expect(result.current.isLoading).toBe(false));
+        await act(async () => result.current.connect("freighter-id"));
+        queryClient.setQueryData(["private", "wallet"], { balance: "old-account" });
+        mockedWalletService.restoreSession.mockResolvedValueOnce(null);
+
+        await act(async () => {
+            window.dispatchEvent(new Event("focus"));
+        });
+
+        await waitFor(() => expect(result.current.isConnected).toBe(false));
+        expect(result.current.publicKey).toBeNull();
+        expect(queryClient.getQueryData(["private", "wallet"])).toBeUndefined();
+        expect(mockSetAccessToken).toHaveBeenLastCalledWith(null);
     });
 
     describe("network detection & guard", () => {

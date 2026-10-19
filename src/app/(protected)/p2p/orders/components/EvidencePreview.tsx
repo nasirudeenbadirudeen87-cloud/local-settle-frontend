@@ -8,6 +8,7 @@ import { useSignatureCancellation } from "@/features/wallet/hooks/useSignatureCa
 import { CircleCheck, Loader2, Eye, Search } from "lucide-react";
 import { SignatureCancelledModal } from "../../components/SignatureCancelledModal";
 import { useNotifications } from "@/features/notifications";
+import { escrowErrorGuidance } from "@/features/escrow/utils/escrow-error-guidance";
 import { ApiError } from "@/lib/api";
 
 export interface EvidencePreviewProps {
@@ -19,6 +20,7 @@ export interface EvidencePreviewProps {
     expiresAt?: string;
     evidenceUrl?: string | null;
     onStatusChange: () => void;
+    refreshStatus: () => Promise<string | null | undefined>;
     canCancel: boolean;
     isCancelling: boolean;
     onCancelOrder: () => void;
@@ -34,6 +36,7 @@ export function EvidencePreview({
     expiresAt,
     evidenceUrl,
     onStatusChange,
+    refreshStatus,
     canCancel,
     isCancelling,
     onCancelOrder,
@@ -46,8 +49,16 @@ export function EvidencePreview({
     const [timeLeft, setTimeLeft] = useState<string>("00:00");
     const [isExpired, setIsExpired] = useState(false);
     const [pendingAction, setPendingAction] = useState<"fund" | "release" | null>(null);
+    const [previewUnavailable, setPreviewUnavailable] = useState(false);
+    const [awaitingFunding, setAwaitingFunding] = useState(false);
     const { notify } = useNotifications();
     const sig = useSignatureCancellation();
+
+    useEffect(() => {
+        if (escrowStatus === "funded" || escrowStatus === "fiat_sent" || escrowStatus === "released") {
+            setAwaitingFunding(false);
+        }
+    }, [escrowStatus]);
 
     useEffect(() => {
         const target = expiresAt ? Date.parse(expiresAt) : Number.NaN;
@@ -97,8 +108,8 @@ export function EvidencePreview({
             if (!fundXdr) throw new Error("Funding failed: no unsigned XDR returned");
             const signedXdr = await sig.sign(fundXdr);
             await syncEscrow({ escrowId, action: "fund", signedXdr });
-            await updateOrder({ orderStatus: "locked" }, orderId);
-            notify("success", "Escrow funded successfully on-chain!");
+            setAwaitingFunding(true);
+            notify("info", "Funding submitted. Waiting for on-chain confirmation before payment instructions are available.");
             onStatusChange();
         } catch (err: unknown) {
             if (isSignatureCancelled(err)) {
@@ -110,7 +121,7 @@ export function EvidencePreview({
                 await onStatusChange();
                 return;
             }
-            alert(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            notify("error", escrowErrorGuidance(err));
         } finally {
             setIsSubmitting(false);
         }
@@ -140,7 +151,7 @@ export function EvidencePreview({
                 await onStatusChange();
                 return;
             }
-            alert(`Error releasing crypto: ${err instanceof Error ? err.message : String(err)}`);
+            notify("error", escrowErrorGuidance(err));
         } finally {
             setIsSubmitting(false);
         }
@@ -155,11 +166,24 @@ export function EvidencePreview({
         if (orderExpired || !escrowId || !pendingAction) return;
         setIsSubmitting(true);
         try {
+            const status = await refreshStatus();
+            const alreadyComplete = pendingAction === "fund" ? status === "funded" : status === "released";
+            if (alreadyComplete) {
+                setPendingAction(null);
+                await onStatusChange();
+                notify("success", "The escrow already reflects this action; no second transaction was sent.");
+                return;
+            }
+            const expected = pendingAction === "fund" ? ["pending", "initialized"] : ["fiat_sent"];
+            if (!status || !expected.includes(status)) {
+                notify("warning", "Escrow status could not confirm that retrying is safe. Refresh the trade before signing again.");
+                return;
+            }
             const signedXdr = await sig.retry();
             if (pendingAction === "fund") {
                 await syncEscrow({ escrowId, action: "fund", signedXdr });
-                await updateOrder({ orderStatus: "locked" }, orderId);
-                notify("success", "Escrow funded successfully on-chain!");
+                setAwaitingFunding(true);
+                notify("info", "Funding submitted. Waiting for on-chain confirmation before payment instructions are available.");
             } else {
                 await syncEscrow({ escrowId, action: "release", signedXdr });
                 await updateOrder({ orderStatus: "released" }, orderId);
@@ -177,7 +201,7 @@ export function EvidencePreview({
                 setPendingAction(null);
                 return;
             }
-            alert(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            notify("error", escrowErrorGuidance(err));
             setPendingAction(null);
         } finally {
             setIsSubmitting(false);
@@ -211,11 +235,11 @@ export function EvidencePreview({
             {/* Minimalist Central Body View Area */}
             <div className="flex-1 flex flex-col justify-center items-center gap-4 shrink-0 min-h-0 w-full h-50">
                 {isUnfunded && (
-                    <div className="w-full flex flex-col items-center justify-center h-full border border-white/[0.02] bg-[#0D1D2C]/40 rounded-[12px] p-4 text-center">
+                    <div role={awaitingFunding ? "status" : undefined} aria-live={awaitingFunding ? "polite" : undefined} className="w-full flex flex-col items-center justify-center h-full border border-white/[0.02] bg-[#0D1D2C]/40 rounded-[12px] p-4 text-center">
                         <span className="text-3xl mb-2">🔒</span>
-                        <p className="text-[15px] font-bold text-[#C2C7D0]">Escrow Contract Awaiting Funds</p>
+                        <p className="text-[15px] font-bold text-[#C2C7D0]">{awaitingFunding ? "Funding Submitted — Awaiting Confirmation" : "Escrow Contract Awaiting Funds"}</p>
                         <p className="text-[12px] text-[rgba(155,171,183,0.8)] mt-1 max-w-[240px]">
-                            Lock your assets in escrow to establish a secure trading environment.
+                            {awaitingFunding ? "Do not send fiat yet. Payment instructions will be available after the network confirms escrow funding." : "Lock your assets in escrow to establish a secure trading environment."}
                         </p>
                     </div>
                 )}
@@ -253,11 +277,16 @@ export function EvidencePreview({
 
                     const renderPreviewFile = () => {
                         if (!evidenceUrl) return <div className="text-white font-mono text-xs">NO FILE</div>;
-                        const isPdfFile = evidenceUrl.toLowerCase().endsWith(".pdf");
+                        const extension = (() => { try { return new URL(evidenceUrl).pathname.split(".").pop()?.toLowerCase() ?? ""; } catch { return ""; } })();
+                        const isPdfFile = extension === "pdf";
+                        if (!isPdfFile && !["png", "jpg", "jpeg", "webp"].includes(extension)) {
+                            return <div className="p-2 text-center text-xs text-[#C2C7D0]">Preview unavailable for this file type. Use Open receipt to download it.</div>;
+                        }
+                        if (previewUnavailable) return <div role="status" className="p-2 text-center text-xs text-amber-300">Evidence link expired or unavailable. Refresh access to try again.</div>;
 
                         if (isPdfFile) {
                             return (
-                                <iframe 
+                                <iframe title="Payment evidence PDF preview"
                                     src={`${evidenceUrl}#toolbar=0&navpanes=0&scrollbar=0`} 
                                     className="w-full h-full border-0 pointer-events-none rounded-[8px]" 
                                 />
@@ -268,6 +297,7 @@ export function EvidencePreview({
                             <img 
                                 src={evidenceUrl} 
                                 alt="Uploaded receipt preview" 
+                                onError={() => setPreviewUnavailable(true)}
                                 className="w-full h-full object-cover rounded-[8px]" 
                             />
                         );
@@ -277,7 +307,7 @@ export function EvidencePreview({
                         <div className="w-full h-full flex flex-col gap-4">
                             <button 
                                 type="button" 
-                                onClick={() => evidenceUrl && window.open(evidenceUrl, '_blank')}
+                                onClick={() => evidenceUrl && window.open(evidenceUrl, '_blank', 'noopener,noreferrer')}
                                 disabled={!evidenceUrl}
                                 className="bg-[#11212E] border border-white/[0.04] w-full h-[48px] text-[#55D6BE] font-bold text-[16px] leading-[24px] rounded-[12px] uppercase flex items-center justify-center gap-2 tracking-[-0.4px] hover:bg-white/[0.04] transition-colors disabled:opacity-50 cursor-pointer"
                             >
@@ -290,7 +320,7 @@ export function EvidencePreview({
                                         EVIDENCE RECEIVED
                                     </span>
                                     <span className="text-[9px] text-[#55D6BE] bg-[#55D6BE]/10 border border-[#55D6BE]/20 font-black p-[2px_8px] rounded-full uppercase tracking-wider font-space">
-                                        Verified
+                                        {evidenceUrl?.split("?")[0].split(".").pop()?.toUpperCase() || "FILE"}
                                     </span>
                                 </div>
                                 
@@ -308,6 +338,7 @@ export function EvidencePreview({
                                         <p className="text-[14px] font-black text-[#D7E0E6] truncate max-w-[160px]">
                                             {getFilenameFromUrl(evidenceUrl)}
                                         </p>
+                                        {evidenceUrl && <button type="button" onClick={() => { setPreviewUnavailable(false); onStatusChange(); }} className="w-fit text-left text-[10px] text-[#55D6BE] underline">Refresh evidence access</button>}
                                         <p className="text-[10px] text-[#55D6BE] font-bold tracking-wider uppercase">
                                             SECURED ON-CHAIN
                                         </p>
@@ -330,11 +361,11 @@ export function EvidencePreview({
                     <button 
                         type="button" 
                         onClick={handleFundAction}
-                        disabled={orderExpired || isSubmitting}
+                        disabled={orderExpired || isSubmitting || awaitingFunding}
                         className="bg-[#55D6BE] w-full h-[56px] text-[#081521] font-extrabold text-[16px] leading-[24px] rounded-[12px] hover:bg-[#dcff15] hover:cursor-pointer uppercase transition-all duration-200 disabled:opacity-50 flex items-center justify-center gap-2 tracking-[-0.4px]"
                     >
                         {isSubmitting ? <Loader2 className="w-5 h-5 text-[#081521] animate-spin" /> : <CircleCheck className="w-5 h-5 text-[#081521] stroke-[3px]" />}
-                        {isSubmitting ? "PROCESSING..." : "FUND ESCROW"}
+                        {isSubmitting ? "PROCESSING..." : awaitingFunding ? "WAITING FOR CONFIRMATION" : "FUND ESCROW"}
                     </button>
                 ) : isWaitingForBuyer ? (
                     isExpired ? (

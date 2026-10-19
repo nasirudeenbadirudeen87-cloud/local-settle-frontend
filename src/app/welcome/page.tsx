@@ -28,7 +28,7 @@ export function ConnectWalletModal({
   onClose: () => void;
 }) {
   const { connect, disconnect, isConnected, walletId, error } = useWalletContext();
-  const { availability } = useWalletAvailability();
+  const { availability, isLoading: isCheckingWallets, error: walletAvailabilityError } = useWalletAvailability();
   const router = useRouter();
   const [modalState, setModalState] = useState<
     "select" | "connecting" | "failed"
@@ -165,6 +165,10 @@ export function ConnectWalletModal({
             )}
             )}
 
+            <div className="mb-6 rounded-2xl border border-[#55D6BE]/25 bg-[#55D6BE]/10 p-4 text-sm leading-relaxed text-[#C2C7D0]">
+              <p><strong className="text-white">Wallet signatures</strong> verify that you control your address when you log in. A separate transaction signature approves a payment, and your wallet shows its details before you approve it. LocalSettle never asks for your secret or recovery phrase.</p>
+            </div>
+
             {/* Development Disclaimer Banner */}
             <div className="mb-6 bg-blue-500/10 border border-blue-500/20 rounded-2xl p-4 flex gap-3 text-sm text-blue-200">
               <svg className="w-6 h-6 flex-shrink-0 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -229,6 +233,16 @@ export function ConnectWalletModal({
                   <span className="bg-[#0C1B27] px-2 text-gray-500 uppercase tracking-wider">Or connect to Testnet</span>
                 </div>
               </div>
+
+              {walletAvailabilityError ? (
+                <p role="status" className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                  {walletAvailabilityError}
+                </p>
+              ) : !isCheckingWallets && !Object.values(availability).some(Boolean) ? (
+                <p role="status" className="rounded-xl border border-white/10 bg-white/5 p-3 text-xs text-gray-300">
+                  No supported wallet was detected. Install one of the listed wallets to connect; you can still browse the app without connecting.
+                </p>
+              ) : null}
 
               {/* Wallet Options — driven by the shared Stellar Wallets Kit config,
                   so adding a wallet only means editing config/wallet-options.ts.

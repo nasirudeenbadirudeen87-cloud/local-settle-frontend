@@ -6,6 +6,7 @@ import { getStellarNetworkConfig } from "../config/stellar-network";
 // Última wallet usada
 const WALLET_ID_KEY = "wallet:provider";
 const PUBLICKEY_KEY = "wallet:publicKey";
+const WALLET_CONNECT_TIMEOUT_MS = 30_000;
 
 interface ChallengeResponse {
     challenge: string;
@@ -19,7 +20,12 @@ interface LoginResponse {
 }
 
 function normalizeSignature(signature: string): string {
-    return signature.trim();
+    const value = signature.trim();
+    const validBase64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+    if (!value || value.length % 4 !== 0 || !validBase64.test(value)) {
+        throw new Error("The wallet returned an invalid signature. Reconnect and sign the login request again.");
+    }
+    return value;
 }
 
 function isExpiredChallengeError(error: unknown): boolean {
@@ -38,7 +44,7 @@ function isRevokedWalletAccess(error: unknown): boolean {
         message.includes("permission denied") || message.includes("unauthorized");
 }
 
-let authInFlight: Promise<string> | null = null;
+const authInFlight = new Map<string, Promise<string>>();
 
 async function requestChallenge(publicKey: string): Promise<ChallengeResponse> {
     return apiFetch<ChallengeResponse>("/auth/challenge", {
@@ -105,7 +111,21 @@ export const walletService = {
 
     // Conecta la wallet indicada a través de Stellar Wallets Kit
     async connect(walletId: string): Promise<string> {
-        const publicKey = await stellarWalletKitService.connect(walletId);
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        let publicKey: string;
+        try {
+            publicKey = await Promise.race([
+                stellarWalletKitService.connect(walletId),
+                new Promise<never>((_, reject) => {
+                    timeoutId = setTimeout(
+                        () => reject(new Error("Wallet connection timed out. Please try again.")),
+                        WALLET_CONNECT_TIMEOUT_MS,
+                    );
+                }),
+            ]);
+        } finally {
+            if (timeoutId) clearTimeout(timeoutId);
+        }
 
         localStorage.setItem(WALLET_ID_KEY, walletId);
         localStorage.setItem(PUBLICKEY_KEY, publicKey);
@@ -130,11 +150,10 @@ export const walletService = {
     },
 
     async authenticate(publicKey: string): Promise<string> {
-        if (authInFlight) {
-            return authInFlight;
-        }
+        const existingAttempt = authInFlight.get(publicKey);
+        if (existingAttempt) return existingAttempt;
 
-        authInFlight = (async () => {
+        const attempt = (async () => {
             let currentChallenge = "";
 
             try {
@@ -179,10 +198,11 @@ export const walletService = {
             }
         })();
 
+        authInFlight.set(publicKey, attempt);
         try {
-            return await authInFlight;
+            return await attempt;
         } finally {
-            authInFlight = null;
+            if (authInFlight.get(publicKey) === attempt) authInFlight.delete(publicKey);
         }
     },
 
